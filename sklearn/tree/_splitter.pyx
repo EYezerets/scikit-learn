@@ -15,6 +15,11 @@
 #
 # License: BSD 3 clause
 
+# This code is a fork from: https://github.com/scikit-learn/scikit-learn/blob/master/sklearn/tree/_splitter.pyx
+# Changes to implement honesty are borrowed extensively from EconML tree implementation, 
+# which is licensed under the MIT License.
+# https://github.com/microsoft/EconML/tree/master/econml/tree
+
 from ._criterion cimport Criterion
 
 from libc.stdlib cimport free
@@ -46,7 +51,10 @@ cdef DTYPE_t EXTRACT_NNZ_SWITCH = 0.1
 cdef inline void _init_split(SplitRecord* self, SIZE_t start_pos) nogil:
     self.impurity_left = INFINITY
     self.impurity_right = INFINITY
+    self.impurity_left_val = INFINITY
+    self.impurity_right_val = INFINITY
     self.pos = start_pos
+    self.pos_val = start_pos_val
     self.feature = 0
     self.threshold = 0.
     self.improvement = -INFINITY
@@ -58,14 +66,18 @@ cdef class Splitter:
     sparse and dense data, one split at a time.
     """
 
-    def __cinit__(self, Criterion criterion, SIZE_t max_features,
-                  SIZE_t min_samples_leaf, double min_weight_leaf,
+    def __cinit__(self, Criterion criterion, Criterion criterion_val, SIZE_t max_features,
+                  SIZE_t min_samples_leaf, double min_weight_leaf, 
+                  DTYPE_t min_balancedness_tol, bint honest,
                   object random_state):
         """
         Parameters
         ----------
         criterion : Criterion
-            The criterion to measure the quality of a split.
+            The criterion to measure the quality of a split (on the train set).
+
+        criterion_val : Criterion
+            The criterion to measure the quality of a split (on the val set).
 
         max_features : SIZE_t
             The maximal number of randomly selected features which can be
@@ -80,11 +92,25 @@ cdef class Splitter:
             The minimal weight each leaf can have, where the weight is the sum
             of the weights of each sample in it.
 
+        min_balancedness_tol : DTYPE_t
+            Tolerance level of how balanced a split can be (in [0, .5]) with
+            0 meaning split has to be fully balanced and .5 meaning no balancedness
+            constraint. Constraint is enforced on both train and val set separately.
+
+        honest : bint
+            Turns honest splitting on or off 
+            (whether we should use different samples for training and testing).
+
         random_state : object
             The user inputted random state to be used for pseudo-randomness
         """
 
         self.criterion = criterion
+
+        if honest:
+            self.criterion_val = criterion_val
+        else:
+            self.criterion_val = criterion
 
         self.samples = NULL
         self.n_samples = 0
@@ -92,11 +118,21 @@ cdef class Splitter:
         self.n_features = 0
         self.feature_values = NULL
 
+        self.samples_val = NULL
+        self.n_samples_val = 0
+        self.features_val = NULL
+        self.n_features_val = 0
+        self.feature_values_val = NULL
+
         self.sample_weight = NULL
 
         self.max_features = max_features
         self.min_samples_leaf = min_samples_leaf
         self.min_weight_leaf = min_weight_leaf
+
+        self.min_balancedness_tol = min_balancedness_tol
+        self.honest = honest
+
         self.random_state = random_state
 
     def __dealloc__(self):
@@ -106,6 +142,9 @@ cdef class Splitter:
         free(self.features)
         free(self.constant_features)
         free(self.feature_values)
+        if self.honest:
+            free(self.samples_val)
+            free(self.feature_values_val)
 
     def __getstate__(self):
         return {}
@@ -114,9 +153,11 @@ cdef class Splitter:
         pass
 
     cdef int init(self,
-                   object X,
-                   const DOUBLE_t[:, ::1] y,
-                   DOUBLE_t* sample_weight) except -1:
+                  object X,
+                  const DOUBLE_t[:, ::1] y,
+                  DOUBLE_t* sample_weight,
+                  const SIZE_t[::1] np_samples_train,
+                  const SIZE_t[::1] np_samples_val) except -1:
         """Initialize the splitter.
 
         Take in the input data X, the target Y, and optional sample weights.
@@ -136,14 +177,22 @@ cdef class Splitter:
             The weights of the samples, where higher weighted samples are fit
             closer than lower weight samples. If not provided, all samples
             are assumed to have uniform weight.
+        np_samples_train : ndarray, dtype=SIZE_t
+            The indices of the samples in the train set
+        np_samples_val : ndarray, dtype=SIZE_t
+            The indices of the samples in the val set
         """
 
         self.rand_r_state = self.random_state.randint(0, RAND_R_MAX)
-        cdef SIZE_t n_samples = X.shape[0]
+        cdef SIZE_t n_samples = np_samples_train.shape[0]
 
         # Create a new array which will be used to store nonzero
         # samples from the feature of interest
         cdef SIZE_t* samples = safe_realloc(&self.samples, n_samples)
+
+        # Initialize this array based on the numpy array np_samples_train
+        self.init_sample_inds(self.samples, np_samples_train, sample_weight,
+                         &self.n_samples, &self.weighted_n_samples)
 
         cdef SIZE_t i, j
         cdef double weighted_n_samples = 0.0
@@ -172,16 +221,38 @@ cdef class Splitter:
 
         self.n_features = n_features
 
-        safe_realloc(&self.feature_values, n_samples)
-        safe_realloc(&self.constant_features, n_features)
+        safe_realloc(&self.feature_values, self.n_samples)      # Will store feature_values of the drawn feature
+        safe_realloc(&self.constant_features, self.n_features)  # Used as helper storage
 
+        self.X = X
         self.y = y
-
         self.sample_weight = sample_weight
+
+        # Initialize criterion
+        self.criterion.init(self.y, self.sample_weight, self.weighted_n_samples, self.samples)
+        
+        # If `honest=True` do initialize analogous validation set objects.
+        cdef SIZE_t n_samples_val
+        cdef SIZE_t* samples_val
+        if self.honest:
+            n_samples_val = np_samples_val.shape[0]
+            samples_val = safe_realloc(&self.samples_val, n_samples_val)
+            self.init_sample_inds(self.samples_val, np_samples_val, sample_weight,
+                            &self.n_samples_val, &self.weighted_n_samples_val)
+            safe_realloc(&self.feature_values_val, self.n_samples_val)
+            self.criterion_val.init(self.y, self.sample_weight, self.weighted_n_samples_val,
+                                    self.samples_val)
+        else:
+            self.n_samples_val = self.n_samples
+            self.samples_val = self.samples
+            self.weighted_n_samples_val = self.weighted_n_samples
+            self.feature_values_val = self.feature_values
+
+
         return 0
 
-    cdef int node_reset(self, SIZE_t start, SIZE_t end,
-                        double* weighted_n_node_samples) nogil except -1:
+    cdef int node_reset(self, SIZE_t start, SIZE_t end, SIZE_t start_val, SIZE_t end_val,
+                        double* weighted_n_node_samples, double* weighted_n_node_samples_val) nogil except -1:
         """Reset splitter on node samples[start:end].
 
         Returns -1 in case of failure to allocate memory (and raise MemoryError)
@@ -195,10 +266,20 @@ cdef class Splitter:
             The index of the last sample to consider
         weighted_n_node_samples : ndarray, dtype=double pointer
             The total weight of those samples
+        start_val : SIZE_t
+            The index of the first sample to consider on the val set
+        end_val : SIZE_t
+            The index of the last sample to consider on the val set
+        weighted_n_node_samples_val : double*
+            On output, weighted_n_node_samples_val[0] stores the total weight of the val samples in the node
         """
 
         self.start = start
         self.end = end
+        self.start_val = start_val
+        self.end_val = end_val
+
+        weighted_n_node_samples[0] = self.criterion.weighted_n_node_samples
 
         self.criterion.init(self.y,
                             self.sample_weight,
@@ -207,7 +288,11 @@ cdef class Splitter:
                             start,
                             end)
 
-        weighted_n_node_samples[0] = self.criterion.weighted_n_node_samples
+        if self.honest:
+            self.criterion_val.node_reset(start_val, end_val)
+            weighted_n_node_samples_val[0] = self.criterion_val.weighted_n_node_samples
+        else:
+            weighted_n_node_samples_val[0] = self.criterion.weighted_n_node_samples
         return 0
 
     cdef int node_split(self, double impurity, SplitRecord* split,
@@ -241,7 +326,9 @@ cdef class BaseDenseSplitter(Splitter):
     cdef int init(self,
                   object X,
                   const DOUBLE_t[:, ::1] y,
-                  DOUBLE_t* sample_weight) except -1:
+                  DOUBLE_t* sample_weight,
+                  const SIZE_t[::1] np_samples_train,
+                  const SIZE_t[::1] np_samples_val) except -1:
         """Initialize the splitter
 
         Returns -1 in case of failure to allocate memory (and raise MemoryError)
@@ -249,7 +336,7 @@ cdef class BaseDenseSplitter(Splitter):
         """
 
         # Call parent init
-        Splitter.init(self, X, y, sample_weight)
+        Splitter.init(self, X, y, sample_weight, np_samples_train, np_samples_val)
 
         self.X = X
         return 0
@@ -259,9 +346,12 @@ cdef class BestSplitter(BaseDenseSplitter):
     """Splitter for finding the best split."""
     def __reduce__(self):
         return (BestSplitter, (self.criterion,
+                               self.criterion_val,
                                self.max_features,
                                self.min_samples_leaf,
                                self.min_weight_leaf,
+                               self.min_balancedness_tol,
+                               self.honest,
                                self.random_state), self.__getstate__())
 
     cdef int node_split(self, double impurity, SplitRecord* split,
@@ -275,12 +365,16 @@ cdef class BestSplitter(BaseDenseSplitter):
         cdef SIZE_t* samples = self.samples
         cdef SIZE_t start = self.start
         cdef SIZE_t end = self.end
+        cdef SIZE_t* samples_val = self.samples_val
+        cdef SIZE_t start_val = self.start_val
+        cdef SIZE_t end_val = self.end_val
 
         cdef SIZE_t* features = self.features
         cdef SIZE_t* constant_features = self.constant_features
         cdef SIZE_t n_features = self.n_features
 
         cdef DTYPE_t* Xf = self.feature_values
+        cdef DTYPE_t* Xf_val = self.feature_values_val
         cdef SIZE_t max_features = self.max_features
         cdef SIZE_t min_samples_leaf = self.min_samples_leaf
         cdef double min_weight_leaf = self.min_weight_leaf
@@ -293,6 +387,7 @@ cdef class BestSplitter(BaseDenseSplitter):
         cdef SIZE_t f_i = n_features
         cdef SIZE_t f_j
         cdef SIZE_t p
+        cdef SIZE_t p_val
         cdef SIZE_t feature_idx_offset
         cdef SIZE_t feature_offset
         cdef SIZE_t i
@@ -309,7 +404,7 @@ cdef class BestSplitter(BaseDenseSplitter):
         cdef DTYPE_t current_feature_value
         cdef SIZE_t partition_end
 
-        _init_split(&best, end)
+        _init_split(&best, end, end_val)
 
         # Sample up to max_features without replacement using a
         # Fisher-Yates-based algorithm (using the local variables `f_i` and
@@ -364,6 +459,12 @@ cdef class BestSplitter(BaseDenseSplitter):
 
                 sort(Xf + start, samples + start, end - start)
 
+                if self.honest:
+                    for i in range(start_val, end_val):
+                        Xf_val[i] = self.X[samples_val[i], current.feature]
+                    
+                    sort(Xf_val + start_val, samples_val + start_val, end_val - start_val)
+
                 if Xf[end - 1] <= Xf[start] + FEATURE_THRESHOLD:
                     features[f_j], features[n_total_constants] = features[n_total_constants], features[f_j]
 
@@ -376,6 +477,7 @@ cdef class BestSplitter(BaseDenseSplitter):
 
                     # Evaluate all splits
                     self.criterion.reset()
+                    #FIXME from here
                     p = start
 
                     while p < end:

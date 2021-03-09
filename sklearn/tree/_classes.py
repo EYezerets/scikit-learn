@@ -99,7 +99,8 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                  min_impurity_decrease,
                  min_impurity_split,
                  class_weight=None,
-                 ccp_alpha=0.0):
+                 ccp_alpha=0.0,
+                 honest = False):
         self.criterion = criterion
         self.splitter = splitter
         self.max_depth = max_depth
@@ -113,6 +114,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
         self.min_impurity_split = min_impurity_split
         self.class_weight = class_weight
         self.ccp_alpha = ccp_alpha
+        self.honest = honest
 
     def get_depth(self):
         """Return the depth of the decision tree.
@@ -747,6 +749,10 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
 
         .. versionadded:: 0.22
 
+    honest : Boolean, default = False
+        When True, parameter activates honest splitting of samples between tree construction
+        and posterior evaluation [5,6]. 
+
     Attributes
     ----------
     classes_ : ndarray of shape (n_classes,) or list of ndarray
@@ -815,6 +821,13 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
     .. [4] L. Breiman, and A. Cutler, "Random Forests",
            https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm
 
+    .. [5] R. Guo, R. Mehta, J. Arroyo, H. Helm, C. Shen, and J.T. Vogelstein, 
+           "Estimating Information-Theoretic Quantities with Uncertainty Forests", 2019,
+            Available: http://arxiv.org/abs/1907.00325
+
+    .. [6] S. Wager and S. Athey, "Estimation and Inference of Heterogeneous Treatment Effects
+           using Random Forests", J Am Stat Assoc, 2018, doi:10.1080/01621459.2017.1319839
+
     Examples
     --------
     >>> from sklearn.datasets import load_iris
@@ -842,7 +855,8 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
                  min_impurity_decrease=0.,
                  min_impurity_split=None,
                  class_weight=None,
-                 ccp_alpha=0.0):
+                 ccp_alpha=0.0,
+                 honest = False):
         super().__init__(
             criterion=criterion,
             splitter=splitter,
@@ -856,7 +870,8 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
             random_state=random_state,
             min_impurity_decrease=min_impurity_decrease,
             min_impurity_split=min_impurity_split,
-            ccp_alpha=ccp_alpha)
+            ccp_alpha=ccp_alpha,
+            honest=honest)
 
     def fit(self, X, y, sample_weight=None, check_input=True,
             X_idx_sorted="deprecated"):
@@ -1742,3 +1757,4 @@ class ExtraTreeRegressor(DecisionTreeRegressor):
             min_impurity_split=min_impurity_split,
             random_state=random_state,
             ccp_alpha=ccp_alpha)
+
