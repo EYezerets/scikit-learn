@@ -16,6 +16,11 @@
 #
 # License: BSD 3 clause
 
+# This code is a fork from: https://github.com/scikit-learn/scikit-learn/blob/master/sklearn/tree/_tree.pyx
+# Changes to implement honesty are borrowed extensively from EconML tree implementation, 
+# which is licensed under the MIT License.
+# https://github.com/microsoft/EconML/tree/master/econml/tree
+
 from cpython cimport Py_INCREF, PyObject, PyTypeObject
 
 from libc.stdlib cimport free
@@ -68,12 +73,30 @@ cdef SIZE_t _TREE_LEAF = TREE_LEAF
 cdef SIZE_t _TREE_UNDEFINED = TREE_UNDEFINED
 cdef SIZE_t INITIAL_STACK_SIZE = 10
 
-# Build the corresponding numpy dtype for Node.
-# This works by casting `dummy` to an array of Node of length 1, which numpy
-# can construct a `dtype`-object for. See https://stackoverflow.com/q/62448946
-# for a more detailed explanation.
-cdef Node dummy;
-NODE_DTYPE = np.asarray(<Node[:1]>(&dummy)).dtype
+# The definition of a numpy type to be used for converting the malloc'ed memory space that
+# contains an array of Node struct's into a structured numpy parallel array that can be as
+# array[key][index].
+NODE_DTYPE = np.dtype({
+    'names': ['left_child', 'right_child', 'depth', 'feature', 'threshold',
+              'impurity', 'n_node_samples', 'weighted_n_node_samples',
+              'impurity_train', 'n_node_samples_train', 'weighted_n_node_samples_train'],
+    'formats': [np.intp, np.intp, np.intp, np.intp, np.float64,
+                np.float64, np.intp, np.float64,
+                np.float64, np.intp, np.float64],
+    'offsets': [
+        <Py_ssize_t> &(<Node*> NULL).left_child,
+        <Py_ssize_t> &(<Node*> NULL).right_child,
+        <Py_ssize_t> &(<Node*> NULL).depth,
+        <Py_ssize_t> &(<Node*> NULL).feature,
+        <Py_ssize_t> &(<Node*> NULL).threshold,
+        <Py_ssize_t> &(<Node*> NULL).impurity,
+        <Py_ssize_t> &(<Node*> NULL).n_node_samples,
+        <Py_ssize_t> &(<Node*> NULL).weighted_n_node_samples,
+        <Py_ssize_t> &(<Node*> NULL).impurity_train,
+        <Py_ssize_t> &(<Node*> NULL).n_node_samples_train,
+        <Py_ssize_t> &(<Node*> NULL).weighted_n_node_samples_train,
+    ]
+})
 
 # =============================================================================
 # TreeBuilder
@@ -82,7 +105,9 @@ NODE_DTYPE = np.asarray(<Node[:1]>(&dummy)).dtype
 cdef class TreeBuilder:
     """Interface for different tree building strategies."""
 
-    cpdef build(self, Tree tree, object X, np.ndarray y,
+    cpdef build(self, Tree tree, object X, np.ndarray y, 
+                np.ndarray samples_train,
+                np.ndarray samples_val,
                 np.ndarray sample_weight=None):
         """Build a decision tree from the training set (X, y)."""
         pass
@@ -134,8 +159,25 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         self.min_impurity_split = min_impurity_split
 
     cpdef build(self, Tree tree, object X, np.ndarray y,
+                np.ndarray samples_train,
+                np.ndarray samples_val,
                 np.ndarray sample_weight=None):
-        """Build a decision tree from the training set (X, y)."""
+        """Build a decision tree from the training set (X, y).
+
+        Parameters
+        ----------
+        X : (n, d) np.array
+            The features to use for splitting
+        y : (n, p) np.array
+            Any information used by the criterion to calculate the node values for a given node defined by
+            the X's
+        samples_train : (n,) np.array of type np.intp
+            The indices of the samples in X to be used for creating the splits of the tree (training set).
+        samples_val : (n,) np.array of type np.intp
+            The indices of the samples in X to be used for calculating the node values of the tree (val set).
+        sample_weight : (n,) np.array of type np.float64
+            The weight of each sample
+        """
 
         # check input
         X, y, sample_weight = self._check_input(X, y, sample_weight)
@@ -168,12 +210,17 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
         cdef SIZE_t start
         cdef SIZE_t end
+        cdef SIZE_t start_val
+        cdef SIZE_t end_val
         cdef SIZE_t depth
         cdef SIZE_t parent
         cdef bint is_left
         cdef SIZE_t n_node_samples = splitter.n_samples
         cdef double weighted_n_samples = splitter.weighted_n_samples
         cdef double weighted_n_node_samples
+        cdef SIZE_t n_node_samples_val = splitter.n_samples_val                # Total number of val samples
+        cdef double weighted_n_samples_val = splitter.weighted_n_samples_val   # Total weight of val samples
+        cdef double weighted_n_node_samples_val # Will be storing the total val weight of the current node
         cdef SplitRecord split
         cdef SIZE_t node_id
 
@@ -189,7 +236,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
         with nogil:
             # push root node onto stack
-            rc = stack.push(0, n_node_samples, 0, _TREE_UNDEFINED, 0, INFINITY, 0)
+            rc = stack.push(0, n_node_samples, 0, n_node_samples_val, 0, _TREE_UNDEFINED, 0, INFINITY, 0)
             if rc == -1:
                 # got return code -1 - out-of-memory
                 with gil:
@@ -200,20 +247,32 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
                 start = stack_record.start
                 end = stack_record.end
+                start_val = stack_record.start_val
+                end_val = stack_record.end_val
                 depth = stack_record.depth
                 parent = stack_record.parent
                 is_left = stack_record.is_left
                 impurity = stack_record.impurity
+                impurity_val = stack_record.impurity_val
                 n_constant_features = stack_record.n_constant_features
 
                 n_node_samples = end - start
-                splitter.node_reset(start, end, &weighted_n_node_samples)
+                n_node_samples_val = end_val - start_val
+                # Let's reset the splitter to the initial state of considering the current node to split
+                # This will also return the total weight of the node in the training and validation set
+                # in the two variables passed by reference.
+                splitter.node_reset(start, end, &weighted_n_node_samples,
+                                    start_val, end_val, &weighted_n_node_samples_val)
 
                 is_leaf = (depth >= max_depth or
                            n_node_samples < min_samples_split or
                            n_node_samples < 2 * min_samples_leaf or
-                           weighted_n_node_samples < 2 * min_weight_leaf)
+                           weighted_n_node_samples < 2 * min_weight_leaf or
+                           n_node_samples_val < min_samples_split or
+                           n_node_samples_val < 2 * min_samples_leaf or
+                           weighted_n_node_samples_val < 2 * min_weight_leaf)
 
+                #FIXME from here
                 if first:
                     impurity = splitter.node_impurity()
                     first = 0
