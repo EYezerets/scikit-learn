@@ -156,7 +156,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         self.min_weight_leaf = min_weight_leaf
         self.max_depth = max_depth
         self.min_impurity_decrease = min_impurity_decrease
-        self.min_impurity_split = min_impurity_split
+        self.min_impurity_split = min_impurity_split # deprecated
 
     cpdef build(self, Tree tree, object X, np.ndarray y,
                 np.ndarray samples_train,
@@ -203,7 +203,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         cdef double min_weight_leaf = self.min_weight_leaf
         cdef SIZE_t min_samples_split = self.min_samples_split
         cdef double min_impurity_decrease = self.min_impurity_decrease
-        cdef double min_impurity_split = self.min_impurity_split
+        cdef double min_impurity_split = self.min_impurity_split # deprecated
 
         # Recursive partition (without actual recursion)
         splitter.init(X, y, sample_weight_ptr)
@@ -225,6 +225,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         cdef SIZE_t node_id
 
         cdef double impurity = INFINITY
+        cdef double proxy_impurity = INFINITY # from EconML
         cdef SIZE_t n_constant_features
         cdef bint is_leaf
         cdef bint first = 1
@@ -273,25 +274,26 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                            weighted_n_node_samples_val < 2 * min_weight_leaf)
 
                 #FIXME from here
-                if first:
-                    impurity = splitter.node_impurity()
+                 if (splitter.is_children_impurity_proxy()) or first:
+                    proxy_impurity = splitter.proxy_node_impurity()
+                    impurity = splitter.node_impurity()             # The node impurity on the training set
+                    impurity_val = splitter.node_impurity_val()     # The node impurity on the val set
+                    first = 0
+                else:
+                    proxy_impurity = impurity
+
+                if not is_leaf:
+                    splitter.node_split(proxy_impurity, &split, &n_constant_features)
                     first = 0
 
                 is_leaf = (is_leaf or
-                           (impurity <= min_impurity_split))
-
-                if not is_leaf:
-                    splitter.node_split(impurity, &split, &n_constant_features)
-                    # If EPSILON=0 in the below comparison, float precision
-                    # issues stop splitting, producing trees that are
-                    # dissimilar to v0.18
-                    is_leaf = (is_leaf or split.pos >= end or
-                               (split.improvement + EPSILON <
-                                min_impurity_decrease))
+                               split.pos >= end or # no split of the training set was valid
+                               split.pos_val >= end_val or # no split of the validation set was valid
+                               (split.improvement + EPSILON < min_impurity_decrease)) # min impurity is violated
 
                 node_id = tree._add_node(parent, is_left, is_leaf, split.feature,
                                          split.threshold, impurity, n_node_samples,
-                                         weighted_n_node_samples)
+                                         weighted_n_node_samples, impurity_val, n_node_samples_val, weighted_n_node_samples_val)
 
                 if node_id == SIZE_MAX:
                     rc = -1
@@ -299,18 +301,18 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
                 # Store value for all nodes, to facilitate tree/model
                 # inspection and interpretation
-                splitter.node_value(tree.value + node_id * tree.value_stride)
+                splitter.node_value_val(tree.value + node_id * tree.value_stride)
 
                 if not is_leaf:
                     # Push right child on stack
-                    rc = stack.push(split.pos, end, depth + 1, node_id, 0,
-                                    split.impurity_right, n_constant_features)
+                    rc = stack.push(split.pos, end, split.pos_val, end_val, depth + 1, node_id, 0,
+                                    split.impurity_right, split.impurity_right_val, n_constant_features)
                     if rc == -1:
                         break
 
                     # Push left child on stack
-                    rc = stack.push(start, split.pos, depth + 1, node_id, 1,
-                                    split.impurity_left, n_constant_features)
+                    rc = stack.push(start, split.pos, start_val, split.pos_val, depth + 1, node_id, 1,
+                                    split.impurity_left, split.impurity_left_val, n_constant_features)
                     if rc == -1:
                         break
 
@@ -646,6 +648,17 @@ cdef class Tree:
     property weighted_n_node_samples:
         def __get__(self):
             return self._get_node_ndarray()['weighted_n_node_samples'][:self.node_count]
+        property impurity_train:
+        def __get__(self):
+            return self._get_node_ndarray()['impurity_train'][:self.node_count]
+
+    property n_node_samples_train:
+        def __get__(self):
+            return self._get_node_ndarray()['n_node_samples_train'][:self.node_count]
+
+    property weighted_n_node_samples_train:
+        def __get__(self):
+            return self._get_node_ndarray()['weighted_n_node_samples_train'][:self.node_count]
 
     property value:
         def __get__(self):
@@ -778,9 +791,10 @@ cdef class Tree:
         return 0
 
     cdef SIZE_t _add_node(self, SIZE_t parent, bint is_left, bint is_leaf,
-                          SIZE_t feature, double threshold, double impurity,
-                          SIZE_t n_node_samples,
-                          double weighted_n_node_samples) nogil except -1:
+                          SIZE_t feature, double threshold, double impurity_train, SIZE_t n_node_samples_train,
+                          double weighted_n_node_samples_train,
+                          double impurity_val, SIZE_t n_node_samples_val,
+                          double weighted_n_node_samples_val) nogil except -1:
         """Add a node to the tree.
 
         The new node registers itself as the child of its parent.
@@ -794,15 +808,21 @@ cdef class Tree:
                 return SIZE_MAX
 
         cdef Node* node = &self.nodes[node_id]
-        node.impurity = impurity
-        node.n_node_samples = n_node_samples
-        node.weighted_n_node_samples = weighted_n_node_samples
+        node.impurity = impurity_val
+        node.n_node_samples = n_node_samples_val
+        node.weighted_n_node_samples = weighted_n_node_samples_val
+        node.impurity_train = impurity_train
+        node.n_node_samples_train = n_node_samples_train
+        node.weighted_n_node_samples_train = weighted_n_node_samples_train
 
         if parent != _TREE_UNDEFINED:
             if is_left:
                 self.nodes[parent].left_child = node_id
             else:
                 self.nodes[parent].right_child = node_id
+            node.depth = self.nodes[parent].depth + 1
+        else:
+            node.depth = 0    
 
         if is_leaf:
             node.left_child = _TREE_LEAF

@@ -66,9 +66,9 @@ cdef class Splitter:
     sparse and dense data, one split at a time.
     """
 
-    def __cinit__(self, Criterion criterion, Criterion criterion_val, SIZE_t max_features,
-                  SIZE_t min_samples_leaf, double min_weight_leaf, 
-                  DTYPE_t min_balancedness_tol, bint honest,
+    def __cinit__(self, Criterion criterion, Criterion criterion_val, 
+                  SIZE_t max_features, SIZE_t min_samples_leaf, double min_weight_leaf, 
+                  DTYPE_t min_balancedness_tol, bint honest, double min_eig_leaf, bint min_eig_leaf_on_val,
                   object random_state):
         """
         Parameters
@@ -132,6 +132,8 @@ cdef class Splitter:
 
         self.min_balancedness_tol = min_balancedness_tol
         self.honest = honest
+        self.min_eig_leaf = min_eig_leaf
+        self.min_eig_leaf_on_val = min_eig_leaf_on_val
 
         self.random_state = random_state
 
@@ -151,6 +153,35 @@ cdef class Splitter:
 
     def __setstate__(self, d):
         pass
+
+        cdef int init_sample_inds(self, SIZE_t* samples,
+                               const SIZE_t[::1] np_samples,
+                               DOUBLE_t* sample_weight,
+                               SIZE_t* n_samples,
+                               double* weighted_n_samples) nogil except -1:
+        """ Initialize the cython sample index arrays `samples` based on the python
+        numpy array `np_samples`. Calculate total weight of samples as you go though the pass
+        and store it in the output variable `weighted_n_samples`. Update the number of samples
+        passed via the input/output variable `n_samples` to the number of *positively* weighted
+        samples, so that we only work with that subset.
+        """
+        cdef SIZE_t i, j, ind
+        weighted_n_samples[0] = 0.0
+        j = 0
+        for i in range(np_samples.shape[0]):
+            ind = np_samples[i]
+            # Only work with positively weighted samples
+            if sample_weight == NULL or sample_weight[ind] > 0.0:
+                samples[j] = ind
+                j += 1
+
+            if sample_weight != NULL:
+                weighted_n_samples[0] += sample_weight[ind]
+            else:
+                weighted_n_samples[0] += 1.0
+
+        # Number of samples is number of positively weighted samples
+        n_samples[0] = j
 
     cdef int init(self,
                   object X,
@@ -251,8 +282,8 @@ cdef class Splitter:
 
         return 0
 
-    cdef int node_reset(self, SIZE_t start, SIZE_t end, SIZE_t start_val, SIZE_t end_val,
-                        double* weighted_n_node_samples, double* weighted_n_node_samples_val) nogil except -1:
+    cdef int node_reset(self, SIZE_t start, SIZE_t end, double* weighted_n_node_samples,
+                        SIZE_t start_val, SIZE_t end_val, double* weighted_n_node_samples_val) nogil except -1:
         """Reset splitter on node samples[start:end].
 
         Returns -1 in case of failure to allocate memory (and raise MemoryError)
@@ -278,7 +309,7 @@ cdef class Splitter:
         self.end = end
         self.start_val = start_val
         self.end_val = end_val
-
+        self.criterion.node_reset(start, end)
         weighted_n_node_samples[0] = self.criterion.weighted_n_node_samples
 
         self.criterion.init(self.y,
@@ -307,16 +338,20 @@ cdef class Splitter:
 
         pass
 
-    cdef void node_value(self, double* dest) nogil:
+    cdef void node_value_val(self, double* dest) nogil:
         """Copy the value of node samples[start:end] into dest."""
 
-        self.criterion.node_value(dest)
+        self.criterion_val.node_value(dest)
 
     cdef double node_impurity(self) nogil:
         """Return the impurity of the current node."""
 
         return self.criterion.node_impurity()
 
+    cdef double node_impurity_val(self) nogil:
+        """Return the impurity of the current node on the val set."""
+
+        return self.criterion_val.node_impurity()
 
 cdef class BaseDenseSplitter(Splitter):
     cdef const DTYPE_t[:, :] X
@@ -352,6 +387,8 @@ cdef class BestSplitter(BaseDenseSplitter):
                                self.min_weight_leaf,
                                self.min_balancedness_tol,
                                self.honest,
+                               self.min_eig_leaf,
+                               self.min_eig_leaf_on_val,
                                self.random_state), self.__getstate__())
 
     cdef int node_split(self, double impurity, SplitRecord* split,
@@ -378,11 +415,14 @@ cdef class BestSplitter(BaseDenseSplitter):
         cdef SIZE_t max_features = self.max_features
         cdef SIZE_t min_samples_leaf = self.min_samples_leaf
         cdef double min_weight_leaf = self.min_weight_leaf
+        cdef double min_eig_leaf = self.min_eig_leaf
         cdef UINT32_t* random_state = &self.rand_r_state
 
         cdef SplitRecord best, current
         cdef double current_proxy_improvement = -INFINITY
         cdef double best_proxy_improvement = -INFINITY
+        cdef double current_threshold = 0.0
+        cdef double weighted_n_node_samples, weighted_n_samples, weighted_n_left, weighted_n_right
 
         cdef SIZE_t f_i = n_features
         cdef SIZE_t f_j
@@ -477,10 +517,12 @@ cdef class BestSplitter(BaseDenseSplitter):
 
                     # Evaluate all splits
                     self.criterion.reset()
-                    #FIXME from here
-                    p = start
+                    if self.honest:
+                        self.criterion_val.reset() # If honest, then reset val criterion too
+                    p = start + <int>floor((.5 - self.min_balancedness_tol) * (end - start)) - 1
+                    p_val = start_val   # p_val will track p so no need to add the offset
 
-                    while p < end:
+                    while p < end and p_val < end_val:
                         while (p + 1 < end and
                                Xf[p + 1] <= Xf[p] + FEATURE_THRESHOLD):
                             p += 1
@@ -491,37 +533,84 @@ cdef class BestSplitter(BaseDenseSplitter):
                         # (p >= end) or (X[samples[p], current.feature] >
                         #                X[samples[p - 1], current.feature])
 
-                        if p < end:
-                            current.pos = p
+                        current_threshold = Xf[p] / 2.0 + Xf[p - 1] / 2.0
+                        if ((current_threshold == Xf[p]) or
+                            (current_threshold == INFINITY) or
+                            (current_threshold == -INFINITY)):
+                            current_threshold = Xf[p - 1]
 
+                        # We need to advance p_val such that if we partition samples_val[start_val:end_val]
+                        # into samples_val[start_val:best.pos_val] and samples_val[best:pos_val:end_val], then
+                        # the first part contains all samples in Xval that are below the threshold. Thus we need
+                        # to advance p_val, until Xf_val[p_val] is the first p such that Xf_val[p] > threshold.
+                        if self.honest:
+                            while (p_val < end_val and
+                                Xf_val[p_val] <= current_threshold):
+                                p_val += 1
+                        else:
+                            p_val = p   # If not honest then p_val is same as p
+
+                        if p < end and p_val < end_val:
+                            current.pos = p
+                            current.pos_val = p_val
+                            if (end - current.pos) < (.5 - self.min_balancedness_tol) * (end - start):
+                                break
+                            if (current.pos_val - start_val) < (.5 - self.min_balancedness_tol) * (end_val - start_val):
+                                continue
+                            if (end_val - current.pos_val) < (.5 - self.min_balancedness_tol) * (end_val - start_val):
+                                break
                             # Reject if min_samples_leaf is not guaranteed
                             if (((current.pos - start) < min_samples_leaf) or
                                     ((end - current.pos) < min_samples_leaf)):
                                 continue
-
+                             if (end - current.pos) < min_samples_leaf:
+                                break
+                            # Reject if min_samples_leaf is not guaranteed on val
+                            if (current.pos_val - start_val) < min_samples_leaf:
+                                continue
+                            if (end_val - current.pos_val) < min_samples_leaf:
+                                break
                             self.criterion.update(current.pos)
+                            if self.honest:
+                                self.criterion_val.update(current.pos_val)  # similarly for criterion_val if honest
 
                             # Reject if min_weight_leaf is not satisfied
                             if ((self.criterion.weighted_n_left < min_weight_leaf) or
                                     (self.criterion.weighted_n_right < min_weight_leaf)):
                                 continue
+                            if self.criterion.weighted_n_right < min_weight_leaf:
+                                break
+                            # Reject if minimum eigenvalue proxy requirement is not satisfied on train
+                            # We do not check this constraint on val, since the eigenvalue proxy can depend on
+                            # label information and we will be violating honesty.
+                            if min_eig_leaf >= 0.0:
+                                if self.criterion.min_eig_left() < min_eig_leaf:
+                                    continue
+                                if self.criterion.min_eig_right() < min_eig_leaf:
+                                    continue
+                                if self.min_eig_leaf_on_val:
+                                    if self.criterion_val.min_eig_left() < min_eig_leaf:
+                                        continue
+                                    if self.criterion_val.min_eig_right() < min_eig_leaf:
+                                        continue
 
+                            # Reject if min_weight_leaf constraint is violated
+                            if self.honest:
+                                if self.criterion_val.weighted_n_left < min_weight_leaf:
+                                    continue
+                                if self.criterion_val.weighted_n_right < min_weight_leaf:
+                                    break
                             current_proxy_improvement = self.criterion.proxy_impurity_improvement()
 
                             if current_proxy_improvement > best_proxy_improvement:
                                 best_proxy_improvement = current_proxy_improvement
                                 # sum of halves is used to avoid infinite value
-                                current.threshold = Xf[p - 1] / 2.0 + Xf[p] / 2.0
-
-                                if ((current.threshold == Xf[p]) or
-                                    (current.threshold == INFINITY) or
-                                    (current.threshold == -INFINITY)):
-                                    current.threshold = Xf[p - 1]
-
+                                current.threshold = current_threshold
+                                
                                 best = current  # copy
 
         # Reorganize into samples[start:best.pos] + samples[best.pos:end]
-        if best.pos < end:
+        if best.pos < end and best.pos_val < end_val:
             partition_end = end
             p = start
 
@@ -533,13 +622,40 @@ cdef class BestSplitter(BaseDenseSplitter):
                     partition_end -= 1
 
                     samples[p], samples[partition_end] = samples[partition_end], samples[p]
+            if self.honest:
+                partition_end = end_val
+                p = start_val
+
+                while p < partition_end:
+                    if self.X[samples_val[p], best.feature] <= best.threshold:
+                        p += 1
+                    else:
+                        partition_end -= 1
+
+                        samples_val[p], samples_val[partition_end] = samples_val[partition_end], samples_val[p]
 
             self.criterion.reset()
             self.criterion.update(best.pos)
+            if self.honest:
+                self.criterion_val.reset()
+                self.criterion_val.update(best.pos_val)
             self.criterion.children_impurity(&best.impurity_left,
                                              &best.impurity_right)
-            best.improvement = self.criterion.impurity_improvement(
-                impurity, best.impurity_left, best.impurity_right)
+            # Calculate a more accurate version of impurity improvement using the input baseline impurity
+            # passed here by the TreeBuilder. The TreeBuilder uses the proxy_node_impurity() to calculate
+            # this baseline if self.is_children_impurity_proxy(), else uses the call to children_impurity()
+            # on the parent node, when that node was split.
+            best.improvement = self.criterion.impurity_improvement(impurity)
+            # if we need children impurities by the builder, then we populate these entries
+            # otherwise, we leave them blank to avoid the extra computation.
+            if not self.is_children_impurity_proxy():
+                self.criterion.children_impurity(&best.impurity_left, &best.impurity_right)
+                if self.honest:
+                    self.criterion_val.children_impurity(&best.impurity_left_val,
+                                                         &best.impurity_right_val)
+                else:
+                    best.impurity_left_val = best.impurity_left
+                    best.impurity_right_val = best.impurity_right
 
         # Respect invariant for constant features: the original order of
         # element in features[:n_known_constants] must be preserved for sibling
