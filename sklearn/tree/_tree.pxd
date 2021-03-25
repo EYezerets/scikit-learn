@@ -25,14 +25,18 @@ from ._splitter cimport SplitRecord
 cdef struct Node:
     # Base storage structure for the nodes in a Tree object
 
-    SIZE_t left_child                    # id of the left child of the node
+    SIZE_t left_child                   # id of the left child of the node
     SIZE_t right_child                   # id of the right child of the node
+    SIZE_t depth                         # the depth level of the node
     SIZE_t feature                       # Feature used for splitting the node
     DOUBLE_t threshold                   # Threshold value at the node
-    DOUBLE_t impurity                    # Impurity of the node (i.e., the value of the criterion)
-    SIZE_t n_node_samples                # Number of samples at the node
-    DOUBLE_t weighted_n_node_samples     # Weighted number of samples at the node
-
+    DOUBLE_t impurity                    # Impurity of the node on the val set
+    SIZE_t n_node_samples                # Number of samples at the node on the val set
+    DOUBLE_t weighted_n_node_samples     # Weighted number of samples at the node on the val set
+    DOUBLE_t impurity_train                    # Impurity of the node on the training set
+    DOUBLE_t impurity_val                   # Impurity of the node on the val set
+    SIZE_t n_node_samples_train                # Number of samples at the node on the training set
+    DOUBLE_t weighted_n_node_samples_train     # Weighted number of samples at the node on the training set
 
 cdef class Tree:
     # The Tree object is a binary tree structure constructed by the
@@ -56,9 +60,11 @@ cdef class Tree:
 
     # Methods
     cdef SIZE_t _add_node(self, SIZE_t parent, bint is_left, bint is_leaf,
-                          SIZE_t feature, double threshold, double impurity,
-                          SIZE_t n_node_samples,
-                          double weighted_n_samples) nogil except -1
+                          SIZE_t feature, double threshold,
+                          double impurity_train, SIZE_t n_node_samples_train,
+                          double weighted_n_node_samples_train,
+                          double impurity_val, SIZE_t n_node_samples_val,
+                          double weighted_n_node_samples_val) nogil except -1
     cdef int _resize(self, SIZE_t capacity) nogil except -1
     cdef int _resize_c(self, SIZE_t capacity=*) nogil except -1
 
@@ -100,5 +106,7 @@ cdef class TreeBuilder:
     cdef double min_impurity_decrease   # Impurity threshold for early stopping
 
     cpdef build(self, Tree tree, object X, np.ndarray y,
+                np.ndarray samples_train,
+                np.ndarray samples_val,
                 np.ndarray sample_weight=*)
     cdef _check_input(self, object X, np.ndarray y, np.ndarray sample_weight)

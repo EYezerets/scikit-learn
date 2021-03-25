@@ -26,6 +26,9 @@ from libc.stdlib cimport free
 from libc.stdlib cimport qsort
 from libc.string cimport memcpy
 from libc.string cimport memset
+from libc.math cimport floor
+
+import copy
 
 import numpy as np
 cimport numpy as np
@@ -132,9 +135,7 @@ cdef class Splitter:
 
         self.min_balancedness_tol = min_balancedness_tol
         self.honest = honest
-        self.min_eig_leaf = min_eig_leaf
-        self.min_eig_leaf_on_val = min_eig_leaf_on_val
-
+        
         self.random_state = random_state
 
     def __dealloc__(self):
@@ -387,8 +388,6 @@ cdef class BestSplitter(BaseDenseSplitter):
                                self.min_weight_leaf,
                                self.min_balancedness_tol,
                                self.honest,
-                               self.min_eig_leaf,
-                               self.min_eig_leaf_on_val,
                                self.random_state), self.__getstate__())
 
     cdef int node_split(self, double impurity, SplitRecord* split,
@@ -415,7 +414,6 @@ cdef class BestSplitter(BaseDenseSplitter):
         cdef SIZE_t max_features = self.max_features
         cdef SIZE_t min_samples_leaf = self.min_samples_leaf
         cdef double min_weight_leaf = self.min_weight_leaf
-        cdef double min_eig_leaf = self.min_eig_leaf
         cdef UINT32_t* random_state = &self.rand_r_state
 
         cdef SplitRecord best, current
@@ -580,20 +578,7 @@ cdef class BestSplitter(BaseDenseSplitter):
                                 continue
                             if self.criterion.weighted_n_right < min_weight_leaf:
                                 break
-                            # Reject if minimum eigenvalue proxy requirement is not satisfied on train
-                            # We do not check this constraint on val, since the eigenvalue proxy can depend on
-                            # label information and we will be violating honesty.
-                            if min_eig_leaf >= 0.0:
-                                if self.criterion.min_eig_left() < min_eig_leaf:
-                                    continue
-                                if self.criterion.min_eig_right() < min_eig_leaf:
-                                    continue
-                                if self.min_eig_leaf_on_val:
-                                    if self.criterion_val.min_eig_left() < min_eig_leaf:
-                                        continue
-                                    if self.criterion_val.min_eig_right() < min_eig_leaf:
-                                        continue
-
+                            
                             # Reject if min_weight_leaf constraint is violated
                             if self.honest:
                                 if self.criterion_val.weighted_n_left < min_weight_leaf:

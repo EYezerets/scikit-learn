@@ -79,10 +79,10 @@ cdef SIZE_t INITIAL_STACK_SIZE = 10
 NODE_DTYPE = np.dtype({
     'names': ['left_child', 'right_child', 'depth', 'feature', 'threshold',
               'impurity', 'n_node_samples', 'weighted_n_node_samples',
-              'impurity_train', 'n_node_samples_train', 'weighted_n_node_samples_train'],
+              'impurity_train', 'impurity_val' 'n_node_samples_train', 'weighted_n_node_samples_train'],
     'formats': [np.intp, np.intp, np.intp, np.intp, np.float64,
                 np.float64, np.intp, np.float64,
-                np.float64, np.intp, np.float64],
+                np.float64, np.float64, np.intp, np.float64],
     'offsets': [
         <Py_ssize_t> &(<Node*> NULL).left_child,
         <Py_ssize_t> &(<Node*> NULL).right_child,
@@ -93,6 +93,7 @@ NODE_DTYPE = np.dtype({
         <Py_ssize_t> &(<Node*> NULL).n_node_samples,
         <Py_ssize_t> &(<Node*> NULL).weighted_n_node_samples,
         <Py_ssize_t> &(<Node*> NULL).impurity_train,
+        <Py_ssize_t> &(<Node*> NULL).impurity_val,
         <Py_ssize_t> &(<Node*> NULL).n_node_samples_train,
         <Py_ssize_t> &(<Node*> NULL).weighted_n_node_samples_train,
     ]
@@ -206,7 +207,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
         cdef double min_impurity_split = self.min_impurity_split # deprecated
 
         # Recursive partition (without actual recursion)
-        splitter.init(X, y, sample_weight_ptr)
+        splitter.init(X, y, sample_weight_ptr, samples_train, samples_val)
 
         cdef SIZE_t start
         cdef SIZE_t end
@@ -237,7 +238,8 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
         with nogil:
             # push root node onto stack
-            rc = stack.push(0, n_node_samples, 0, n_node_samples_val, 0, _TREE_UNDEFINED, 0, INFINITY, 0)
+            rc = stack.push(0, n_node_samples, 0, n_node_samples_val,
+                            0, _TREE_UNDEFINED, 0, INFINITY, INFINITY, 0)
             if rc == -1:
                 # got return code -1 - out-of-memory
                 with gil:
@@ -273,8 +275,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                            n_node_samples_val < 2 * min_samples_leaf or
                            weighted_n_node_samples_val < 2 * min_weight_leaf)
 
-                #FIXME from here
-                 if (splitter.is_children_impurity_proxy()) or first:
+                if (splitter.is_children_impurity_proxy()) or first:
                     proxy_impurity = splitter.proxy_node_impurity()
                     impurity = splitter.node_impurity()             # The node impurity on the training set
                     impurity_val = splitter.node_impurity_val()     # The node impurity on the val set
@@ -363,7 +364,9 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
         self.min_impurity_decrease = min_impurity_decrease
         self.min_impurity_split = min_impurity_split
 
-    cpdef build(self, Tree tree, object X, np.ndarray y,
+    cpdef build(self, Tree tree, object X, np.ndarray y, 
+                np.ndarray samples_train,
+                np.ndarray samples_val,
                 np.ndarray sample_weight=None):
         """Build a decision tree from the training set (X, y)."""
 
@@ -648,7 +651,7 @@ cdef class Tree:
     property weighted_n_node_samples:
         def __get__(self):
             return self._get_node_ndarray()['weighted_n_node_samples'][:self.node_count]
-        property impurity_train:
+    property impurity_train:
         def __get__(self):
             return self._get_node_ndarray()['impurity_train'][:self.node_count]
 
@@ -791,7 +794,8 @@ cdef class Tree:
         return 0
 
     cdef SIZE_t _add_node(self, SIZE_t parent, bint is_left, bint is_leaf,
-                          SIZE_t feature, double threshold, double impurity_train, SIZE_t n_node_samples_train,
+                          SIZE_t feature, double threshold,
+                          double impurity_train, SIZE_t n_node_samples_train,
                           double weighted_n_node_samples_train,
                           double impurity_val, SIZE_t n_node_samples_val,
                           double weighted_n_node_samples_val) nogil except -1:
