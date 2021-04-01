@@ -13,7 +13,7 @@
 import numpy as np
 cimport numpy as np
 
-ctypedef np.npy_float32 DTYPE_t          # Type of X
+ctypedef np.npy_float64 DTYPE_t          # Type of X
 ctypedef np.npy_float64 DOUBLE_t         # Type of y, sample_weight
 ctypedef np.npy_intp SIZE_t              # Type for indices and counters
 ctypedef np.npy_int32 INT32_t            # Signed 32 bit integer
@@ -48,7 +48,7 @@ cdef class Tree:
     cdef SIZE_t* n_classes               # Number of classes in y[:, k]
     cdef public SIZE_t n_outputs         # Number of outputs in y
     cdef public SIZE_t max_n_classes     # max(n_classes)
-
+    cdef public SIZE_t n_relevant_outputs # Prefix of the parameters that we care about
     # Inner structures: values are stored separately from node structure,
     # since size is determined at runtime.
     cdef public SIZE_t max_depth         # Max depth of the tree
@@ -62,9 +62,9 @@ cdef class Tree:
     cdef SIZE_t _add_node(self, SIZE_t parent, bint is_left, bint is_leaf,
                           SIZE_t feature, double threshold,
                           double impurity_train, SIZE_t n_node_samples_train,
-                          double weighted_n_node_samples_train,
+                          double weighted_n_samples_train,
                           double impurity_val, SIZE_t n_node_samples_val,
-                          double weighted_n_node_samples_val) nogil except -1
+                          double weighted_n_samples_val) nogil except -1
     cdef int _resize(self, SIZE_t capacity) nogil except -1
     cdef int _resize_c(self, SIZE_t capacity=*) nogil except -1
 
@@ -81,8 +81,8 @@ cdef class Tree:
     cdef object _decision_path_dense(self, object X)
     cdef object _decision_path_sparse_csr(self, object X)
 
-    cpdef compute_feature_importances(self, normalize=*)
-
+    cpdef compute_feature_importances(self, normalize=*, max_depth=*, depth_decay=*)
+#    cpdef compute_feature_heterogeneity_importances(self, normalize=*, max_depth=*, depth_decay=*)
 
 # =============================================================================
 # Tree builder

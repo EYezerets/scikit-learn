@@ -28,6 +28,7 @@ from libc.math cimport fabs
 from libc.string cimport memcpy
 from libc.string cimport memset
 from libc.stdint cimport SIZE_MAX
+from libc.math cimport pow
 
 import numpy as np
 cimport numpy as np
@@ -55,7 +56,7 @@ cdef extern from "numpy/arrayobject.h":
 # Types and constants
 # =============================================================================
 
-from numpy import float32 as DTYPE
+from numpy import float64 as DTYPE # instead of float32
 from numpy import float64 as DOUBLE
 
 cdef double INFINITY = np.inf
@@ -79,7 +80,7 @@ cdef SIZE_t INITIAL_STACK_SIZE = 10
 NODE_DTYPE = np.dtype({
     'names': ['left_child', 'right_child', 'depth', 'feature', 'threshold',
               'impurity', 'n_node_samples', 'weighted_n_node_samples',
-              'impurity_train', 'impurity_val' 'n_node_samples_train', 'weighted_n_node_samples_train'],
+              'impurity_train', 'impurity_val', 'n_node_samples_train', 'weighted_n_node_samples_train'],
     'formats': [np.intp, np.intp, np.intp, np.intp, np.float64,
                 np.float64, np.intp, np.float64,
                 np.float64, np.float64, np.intp, np.float64],
@@ -292,10 +293,11 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                                split.pos_val >= end_val or # no split of the validation set was valid
                                (split.improvement + EPSILON < min_impurity_decrease)) # min impurity is violated
 
-                node_id = tree._add_node(parent, is_left, is_leaf, split.feature,
-                                         split.threshold, impurity, n_node_samples,
-                                         weighted_n_node_samples, impurity_val, n_node_samples_val, weighted_n_node_samples_val)
-
+                node_id = tree._add_node(parent, is_left, is_leaf, 
+                                         split.feature, split.threshold,
+                                         impurity, n_node_samples, weighted_n_node_samples,
+                                         impurity_val, n_node_samples_val, weighted_n_node_samples_val)
+                
                 if node_id == SIZE_MAX:
                     rc = -1
                     break
@@ -385,7 +387,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
         cdef SIZE_t min_samples_split = self.min_samples_split
 
         # Recursive partition (without actual recursion)
-        splitter.init(X, y, sample_weight_ptr)
+        splitter.init(X, y, samples_train, samples_val, sample_weight_ptr)
 
         cdef PriorityHeap frontier = PriorityHeap(INITIAL_STACK_SIZE)
         cdef PriorityHeapRecord record
@@ -520,7 +522,9 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                                  else _TREE_UNDEFINED,
                                  is_left, is_leaf,
                                  split.feature, split.threshold, impurity, n_node_samples,
-                                 weighted_n_node_samples)
+                                 weighted_n_node_samples,
+                                 impurity_val, n_node_samples_val, weighted_n_node_samples_val)
+
         if node_id == SIZE_MAX:
             return -1
 
@@ -1127,7 +1131,7 @@ cdef class Tree:
         return out
 
 
-    cpdef compute_feature_importances(self, normalize=True):
+    cpdef compute_feature_importances(self, normalize=True,max_depth=None, depth_decay=.0):
         """Computes the importance of each feature (aka variable)."""
         cdef Node* left
         cdef Node* right
@@ -1693,11 +1697,11 @@ cdef _build_pruned_tree(
             is_leaf = leaves_in_subtree[orig_node_id]
             node = &orig_tree.nodes[orig_node_id]
 
-            new_node_id = tree._add_node(
-                parent, is_left, is_leaf, node.feature, node.threshold,
-                node.impurity, node.n_node_samples,
-                node.weighted_n_node_samples)
-
+            new_node_id = tree._add_node(parent, is_left, is_leaf, 
+                                         split.feature, split.threshold,
+                                         impurity, n_node_samples, weighted_n_node_samples,
+                                         impurity_val, n_node_samples_val, weighted_n_node_samples_val)
+                
             if new_node_id == SIZE_MAX:
                 rc = -1
                 break
