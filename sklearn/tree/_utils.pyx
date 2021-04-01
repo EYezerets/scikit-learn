@@ -109,8 +109,9 @@ cdef class Stack:
     cdef bint is_empty(self) nogil:
         return self.top <= 0
 
-    cdef int push(self, SIZE_t start, SIZE_t end, SIZE_t depth, SIZE_t parent,
-                  bint is_left, double impurity,
+    cdef int push(self, SIZE_t start, SIZE_t end, SIZE_t start_val, SIZE_t end_val,
+                  SIZE_t depth, SIZE_t parent,
+                  bint is_left, double impurity, double impurity_val,
                   SIZE_t n_constant_features) nogil except -1:
         """Push a new element onto the stack.
 
@@ -129,10 +130,13 @@ cdef class Stack:
         stack = self.stack_
         stack[top].start = start
         stack[top].end = end
+        stack[top].start_val = start_val
+        stack[top].end_val = end_val
         stack[top].depth = depth
         stack[top].parent = parent
         stack[top].is_left = is_left
         stack[top].impurity = impurity
+        stack[top].impurity_val = impurity_val
         stack[top].n_constant_features = n_constant_features
 
         # Increment stack pointer
