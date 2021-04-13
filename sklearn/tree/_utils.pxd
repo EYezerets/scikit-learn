@@ -34,17 +34,17 @@ cdef enum:
 # is equivalent to p = malloc(n * sizeof(*p)) with error checking.
 ctypedef fused realloc_ptr:
     # Add pointer types here as needed.
-    (DTYPE_t*)
+    # (DTYPE_t*)
     (SIZE_t*)
     (unsigned char*)
-    (WeightedPQueueRecord*)
+    # (WeightedPQueueRecord*)
     (DOUBLE_t*)
     (DOUBLE_t**)
     (Node*)
-    (Cell*)
-    (Node**)
+    # (Cell*)
+    # (Node**)
     (StackRecord*)
-    (PriorityHeapRecord*)
+    # (PriorityHeapRecord*)
 
 cdef realloc_ptr safe_realloc(realloc_ptr* p, SIZE_t nelems) nogil except *
 

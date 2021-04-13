@@ -51,7 +51,7 @@ cdef DTYPE_t FEATURE_THRESHOLD = 1e-7
 # in SparseSplitter
 cdef DTYPE_t EXTRACT_NNZ_SWITCH = 0.1
 
-cdef inline void _init_split(SplitRecord* self, SIZE_t start_pos) nogil:
+cdef inline void _init_split(SplitRecord* self, SIZE_t start_pos, SIZE_t start_pos_val) nogil:
     self.impurity_left = INFINITY
     self.impurity_right = INFINITY
     self.impurity_left_val = INFINITY
@@ -72,7 +72,7 @@ cdef class Splitter:
     def __cinit__(self, Criterion criterion, Criterion criterion_val, 
                   SIZE_t max_features, SIZE_t min_samples_leaf, double min_weight_leaf, 
                   DTYPE_t min_balancedness_tol, bint honest, double min_eig_leaf, bint min_eig_leaf_on_val,
-                  object random_state):
+                  UINT32_t random_state):
         """
         Parameters
         ----------
@@ -104,7 +104,7 @@ cdef class Splitter:
             Turns honest splitting on or off 
             (whether we should use different samples for training and testing).
 
-        random_state : object
+        random_state : UINT32_t
             The user inputted random state to be used for pseudo-randomness
         """
 
@@ -115,16 +115,15 @@ cdef class Splitter:
         else:
             self.criterion_val = criterion
 
-        self.samples = NULL
-        self.n_samples = 0
         self.features = NULL
         self.n_features = 0
-        self.feature_values = NULL
 
+        self.samples = NULL
+        self.n_samples = 0        
         self.samples_val = NULL
         self.n_samples_val = 0
-        self.features_val = NULL
         self.n_features_val = 0
+        self.feature_values = NULL
         self.feature_values_val = NULL
 
         self.sample_weight = NULL
@@ -132,11 +131,11 @@ cdef class Splitter:
         self.max_features = max_features
         self.min_samples_leaf = min_samples_leaf
         self.min_weight_leaf = min_weight_leaf
-
         self.min_balancedness_tol = min_balancedness_tol
         self.honest = honest
         
         self.random_state = random_state
+        self.rand_r_state = random_state
 
     def __dealloc__(self):
         """Destructor."""
@@ -155,7 +154,7 @@ cdef class Splitter:
     def __setstate__(self, d):
         pass
 
-        cdef int init_sample_inds(self, SIZE_t* samples,
+    cdef int init_sample_inds(self, SIZE_t* samples,
                                const SIZE_t[::1] np_samples,
                                DOUBLE_t* sample_weight,
                                SIZE_t* n_samples,
@@ -184,12 +183,10 @@ cdef class Splitter:
         # Number of samples is number of positively weighted samples
         n_samples[0] = j
 
-    cdef int init(self,
-                  object X,
-                  const DOUBLE_t[:, ::1] y,
+    cdef int init(self, const DTYPE_t[:, :] X, const DOUBLE_t[:, ::1] y,
                   DOUBLE_t* sample_weight,
                   const SIZE_t[::1] np_samples_train,
-                  const SIZE_t[::1] np_samples_val) except -1:
+                  const SIZE_t[::1] np_samples_val) nogil except -1:
         """Initialize the splitter.
 
         Take in the input data X, the target Y, and optional sample weights.
@@ -261,7 +258,7 @@ cdef class Splitter:
         self.sample_weight = sample_weight
 
         # Initialize criterion
-        self.criterion.init(self.y, self.sample_weight, self.weighted_n_samples, self.samples)
+        self.criterion.init(self.y, self.sample_weight, self.weighted_n_samples, self.samples, self.np_samples_train, self.np_samples_val)
         
         # If `honest=True` do initialize analogous validation set objects.
         cdef SIZE_t n_samples_val
@@ -272,8 +269,7 @@ cdef class Splitter:
             self.init_sample_inds(self.samples_val, np_samples_val, sample_weight,
                             &self.n_samples_val, &self.weighted_n_samples_val)
             safe_realloc(&self.feature_values_val, self.n_samples_val)
-            self.criterion_val.init(self.y, self.sample_weight, self.weighted_n_samples_val,
-                                    self.samples_val)
+            self.criterion_val.init(self.y, self.sample_weight, self.weighted_n_samples, self.samples, self.np_samples_train, self.np_samples_val)
         else:
             self.n_samples_val = self.n_samples
             self.samples_val = self.samples
@@ -285,8 +281,7 @@ cdef class Splitter:
 
     cdef int node_reset(self, SIZE_t start, SIZE_t end, double* weighted_n_node_samples,
                         SIZE_t start_val, SIZE_t end_val, double* weighted_n_node_samples_val) nogil except -1:
-        """Reset splitter on node samples[start:end].
-
+        """Reset splitter on node samples[start:end] on train set and [start_val:end_val] on val set.
         Returns -1 in case of failure to allocate memory (and raise MemoryError)
         or 0 otherwise.
 
@@ -313,12 +308,12 @@ cdef class Splitter:
         self.criterion.node_reset(start, end)
         weighted_n_node_samples[0] = self.criterion.weighted_n_node_samples
 
-        self.criterion.init(self.y,
-                            self.sample_weight,
-                            self.weighted_n_samples,
-                            self.samples,
-                            start,
-                            end)
+        # self.criterion.init(self.y,
+        #                     self.sample_weight,
+        #                     self.weighted_n_samples,
+        #                     self.samples,
+        #                     start,
+        #                     end)
 
         if self.honest:
             self.criterion_val.node_reset(start_val, end_val)
@@ -354,31 +349,49 @@ cdef class Splitter:
 
         return self.criterion_val.node_impurity()
 
-cdef class BaseDenseSplitter(Splitter):
-    cdef const DTYPE_t[:, :] X
+    cdef double proxy_node_impurity(self) nogil:
+        """Return the impurity of the current node on the train set."""
 
-    cdef SIZE_t n_total_samples
+        return self.criterion.proxy_node_impurity()
+    
+    cdef double proxy_node_impurity_val(self) nogil:
+        """Return the impurity of the current node on the val set."""
 
-    cdef int init(self,
-                  object X,
-                  const DOUBLE_t[:, ::1] y,
-                  DOUBLE_t* sample_weight,
-                  const SIZE_t[::1] np_samples_train,
-                  const SIZE_t[::1] np_samples_val) except -1:
-        """Initialize the splitter
+        return self.criterion_val.proxy_node_impurity()
 
-        Returns -1 in case of failure to allocate memory (and raise MemoryError)
-        or 0 otherwise.
+    cdef bint is_children_impurity_proxy(self) nogil:
+        """Whether the criterion method children_impurity() returns an
+        accurate node impurity of the children or just some computationally efficient
+        approximation.
         """
+        return (self.criterion.proxy_children_impurity or
+                self.criterion_val.proxy_children_impurity)
 
-        # Call parent init
-        Splitter.init(self, X, y, sample_weight, np_samples_train, np_samples_val)
+# cdef class BaseDenseSplitter(Splitter):
+#     # cdef const DTYPE_t[:, :] X
 
-        self.X = X
-        return 0
+#     cdef SIZE_t n_total_samples
 
+#     cdef int init(self,
+#                   object X,
+#                   const DOUBLE_t[:, ::1] y,
+#                   DOUBLE_t* sample_weight,
+#                   const SIZE_t[::1] np_samples_train,
+#                   const SIZE_t[::1] np_samples_val) except -1:
+#         """Initialize the splitter
 
-cdef class BestSplitter(BaseDenseSplitter):
+#         Returns -1 in case of failure to allocate memory (and raise MemoryError)
+#         or 0 otherwise.
+#         """
+
+#         # Call parent init
+#         Splitter.init(self, X, y, sample_weight, np_samples_train, np_samples_val)
+
+#         self.X = X
+#         return 0
+
+# cdef class BestSplitter(BaseDenseSplitter):
+cdef class BestSplitter(Splitter):
     """Splitter for finding the best split."""
     def __reduce__(self):
         return (BestSplitter, (self.criterion,
@@ -558,10 +571,9 @@ cdef class BestSplitter(BaseDenseSplitter):
                             if (end_val - current.pos_val) < (.5 - self.min_balancedness_tol) * (end_val - start_val):
                                 break
                             # Reject if min_samples_leaf is not guaranteed
-                            if (((current.pos - start) < min_samples_leaf) or
-                                    ((end - current.pos) < min_samples_leaf)):
+                            if (current.pos - start) < min_samples_leaf:
                                 continue
-                             if (end - current.pos) < min_samples_leaf:
+                            if (end - current.pos) < min_samples_leaf:
                                 break
                             # Reject if min_samples_leaf is not guaranteed on val
                             if (current.pos_val - start_val) < min_samples_leaf:
@@ -573,8 +585,7 @@ cdef class BestSplitter(BaseDenseSplitter):
                                 self.criterion_val.update(current.pos_val)  # similarly for criterion_val if honest
 
                             # Reject if min_weight_leaf is not satisfied
-                            if ((self.criterion.weighted_n_left < min_weight_leaf) or
-                                    (self.criterion.weighted_n_right < min_weight_leaf)):
+                            if self.criterion.weighted_n_left < min_weight_leaf:
                                 continue
                             if self.criterion.weighted_n_right < min_weight_leaf:
                                 break
@@ -590,8 +601,7 @@ cdef class BestSplitter(BaseDenseSplitter):
                             if current_proxy_improvement > best_proxy_improvement:
                                 best_proxy_improvement = current_proxy_improvement
                                 # sum of halves is used to avoid infinite value
-                                current.threshold = current_threshold
-                                
+                                current.threshold = current_threshold                                
                                 best = current  # copy
 
         # Reorganize into samples[start:best.pos] + samples[best.pos:end]
@@ -602,11 +612,11 @@ cdef class BestSplitter(BaseDenseSplitter):
             while p < partition_end:
                 if self.X[samples[p], best.feature] <= best.threshold:
                     p += 1
-
                 else:
                     partition_end -= 1
 
                     samples[p], samples[partition_end] = samples[partition_end], samples[p]
+
             if self.honest:
                 partition_end = end_val
                 p = start_val
@@ -624,13 +634,11 @@ cdef class BestSplitter(BaseDenseSplitter):
             if self.honest:
                 self.criterion_val.reset()
                 self.criterion_val.update(best.pos_val)
-            self.criterion.children_impurity(&best.impurity_left,
-                                             &best.impurity_right)
             # Calculate a more accurate version of impurity improvement using the input baseline impurity
             # passed here by the TreeBuilder. The TreeBuilder uses the proxy_node_impurity() to calculate
             # this baseline if self.is_children_impurity_proxy(), else uses the call to children_impurity()
             # on the parent node, when that node was split.
-            best.improvement = self.criterion.impurity_improvement(impurity)
+            best.improvement = self.criterion.impurity_improvement(impurity, best.impurity_left, best.impurity_right)
             # if we need children impurities by the builder, then we populate these entries
             # otherwise, we leave them blank to avoid the extra computation.
             if not self.is_children_impurity_proxy():
@@ -771,7 +779,7 @@ cdef void heapsort(DTYPE_t* Xf, SIZE_t* samples, SIZE_t n) nogil:
         sift_down(Xf, samples, 0, end)
         end = end - 1
 
-
+'''
 cdef class RandomSplitter(BaseDenseSplitter):
     """Splitter for finding the best random split."""
     def __reduce__(self):
@@ -968,8 +976,8 @@ cdef class RandomSplitter(BaseDenseSplitter):
         split[0] = best
         n_constant_features[0] = n_total_constants
         return 0
-
-
+'''
+'''
 cdef class BaseSparseSplitter(Splitter):
     # The sparse splitter works only with csc sparse matrix format
     cdef DTYPE_t* X_data
@@ -1138,7 +1146,8 @@ cdef class BaseSparseSplitter(Splitter):
                                          self.feature_values,
                                          end_negative, start_positive)
 
-
+'''
+'''
 cdef int compare_SIZE_t(const void* a, const void* b) nogil:
     """Comparison function for sort."""
     return <int>((<SIZE_t*>a)[0] - (<SIZE_t*>b)[0])
@@ -1287,8 +1296,8 @@ cdef inline void sparse_swap(SIZE_t* index_to_samples, SIZE_t* samples,
     samples[pos_1], samples[pos_2] =  samples[pos_2], samples[pos_1]
     index_to_samples[samples[pos_1]] = pos_1
     index_to_samples[samples[pos_2]] = pos_2
-
-
+'''
+'''
 cdef class BestSparseSplitter(BaseSparseSplitter):
     """Splitter for finding the best split, using the sparse data."""
 
@@ -1517,8 +1526,8 @@ cdef class BestSparseSplitter(BaseSparseSplitter):
         split[0] = best
         n_constant_features[0] = n_total_constants
         return 0
-
-
+'''
+'''
 cdef class RandomSparseSplitter(BaseSparseSplitter):
     """Splitter for finding a random split, using the sparse data."""
 
@@ -1746,3 +1755,4 @@ cdef class RandomSparseSplitter(BaseSparseSplitter):
         split[0] = best
         n_constant_features[0] = n_total_constants
         return 0
+'''
